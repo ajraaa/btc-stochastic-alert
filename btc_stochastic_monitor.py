@@ -896,3 +896,305 @@ def bootstrap_history(state: MonitorState) -> None:
             extra={"category": "BOOTSTRAP"},
         )
         return
+
+
+# =============================================================================
+# Indicator + Trigger Orchestrator and WebSocket Callbacks
+# -----------------------------------------------------------------------------
+# These four functions tie the pure data transformations (buffer update,
+# indicator computation, trigger state machine) to the live WebSocket stream.
+#
+# State-binding convention (IMPORTANT, REQ-3.2, REQ-8.4):
+#   ``on_open``, ``on_message``, and ``on_close`` are registered as
+#   ``websocket.WebSocketApp`` callbacks. The WebSocketApp invokes them as
+#   ``on_open(ws)``, ``on_message(ws, raw)``, and ``on_close(ws, code, reason)``
+#   -- i.e. WITHOUT the shared MonitorState. To give them access to the state
+#   that must survive session restarts, each is defined here with ``state`` as
+#   its FIRST positional parameter, and the reconnection loop (task 12.1) binds
+#   it via ``functools.partial(on_message, state)``. The partial yields exactly
+#   the ``(ws, raw)`` callable the WebSocketApp expects, while the buffer and
+#   ``is_oversold`` lock live on the long-lived ``MonitorState`` outside the
+#   session lifecycle (REQ-8.4).
+# =============================================================================
+
+
+def process_data(state: MonitorState, candle: Candle) -> None:
+    # Purpose: orchestrate a single Closed_Candle through the indicator and
+    #   trigger pipeline -- update the buffer, recompute the Stochastic
+    #   Oscillator, evaluate the cool-down trigger, dispatch a Telegram alert on
+    #   FIRE, and emit exactly one indicator-evaluation log record.
+    # Inputs: ``state`` (shared MonitorState; ``buffer`` and ``is_oversold`` may
+    #   mutate) and ``candle`` (the Closed_Candle to ingest).
+    # Returns / side effects: returns None. Mutates ``state.buffer`` (via
+    #   ``update_buffer``) and possibly ``state.is_oversold`` (via
+    #   ``evaluate_trigger``); may POST a Telegram notification; always emits one
+    #   INDICATOR-category INFO record for the candle (REQ-9.2, REQ-10.4,
+    #   REQ-10.5).
+    """Run one Closed_Candle through indicator computation and trigger evaluation.
+
+    Purpose:
+        Implement the ``process_data`` orchestrator referenced throughout the
+        design's Data Flow sequence: apply the Closed_Candle to the bounded
+        candle buffer (REQ-4), recompute the Stochastic Oscillator over the
+        buffer (REQ-5), and -- only when a finite reading is produced -- evaluate
+        the cool-down trigger (REQ-6) and dispatch a Telegram alert on a ``FIRE``
+        decision (REQ-7). Exactly one INDICATOR-category log record is emitted
+        per Closed_Candle so an operator can audit every evaluation (REQ-10.4,
+        REQ-10.5).
+
+    Inputs:
+        state: The shared :class:`MonitorState`. ``state.buffer`` is reassigned
+            by :func:`update_buffer`; ``state.is_oversold`` may be mutated by
+            :func:`evaluate_trigger`.
+        candle: The Closed_Candle (``"x" == True``) forwarded by
+            :func:`on_message`.
+
+    Returns / side effects:
+        Returns ``None``. Side effects:
+
+        * ``state.buffer = update_buffer(state.buffer, candle)`` (REQ-4).
+        * When :func:`compute_stochastic` returns ``None`` (warm-up / NaN /
+          computation error, REQ-5.4, REQ-5.5): emits a single INDICATOR INFO
+          record noting the evaluation was skipped (no finite reading) and
+          returns without touching the trigger (REQ-6.5).
+        * Otherwise calls :func:`evaluate_trigger`; on a ``FIRE`` decision
+          dispatches ``send_telegram_notification(format_alert(...))`` (REQ-6.2,
+          REQ-7) and records the dispatch outcome. Emits exactly one INDICATOR
+          INFO record carrying ``close_time_ms``, ``%K``, ``%D``, and the trigger
+          decision string (plus the dispatch outcome on ``FIRE``) per REQ-10.5.
+    """
+    logger = logging.getLogger(LOGGER_NAME)
+
+    # Step 1 -- buffer update (REQ-4). ``update_buffer`` appends/replaces/discards
+    # and trims to HISTORY_LIMIT while preserving chronological order.
+    state.buffer = update_buffer(state.buffer, candle)
+
+    # Step 2 -- recompute the Stochastic Oscillator over the updated buffer
+    # (REQ-5.1). A ``None`` reading means warm-up rows, a NaN last row, a missing
+    # column, or a computation error -- all of which skip trigger evaluation
+    # (REQ-5.4, REQ-5.5).
+    reading = compute_stochastic(state.buffer)
+
+    if reading is None:
+        # No finite reading: emit one INDICATOR record noting the skip so the
+        # closed candle is still auditable, then return without evaluating the
+        # trigger (REQ-6.5). There are no %K/%D values to log in this case.
+        logger.info(
+            "Indicator evaluation skipped for closed candle "
+            "(open_time_ms=%s): no finite Stochastic reading (warm-up or NaN).",
+            candle.open_time_ms,
+            extra={"category": "INDICATOR"},
+        )
+        return
+
+    # Step 3 -- evaluate the cool-down trigger only after a finite reading is in
+    # hand (REQ-6.5). ``evaluate_trigger`` returns the decision and may mutate
+    # ``state.is_oversold``.
+    decision = evaluate_trigger(state, reading)
+
+    if decision == TriggerDecision.FIRE:
+        # Step 4 -- engagement fired: dispatch exactly one Telegram alert
+        # (REQ-6.2, REQ-7). ``send_telegram_notification`` never raises and emits
+        # its own NOTIFY dispatch record (REQ-10.6); we capture its boolean
+        # outcome to include in this candle's indicator record.
+        dispatched = send_telegram_notification(
+            format_alert(SYMBOL, INTERVAL, reading)
+        )
+        # One INDICATOR record for this candle including the dispatch outcome
+        # (REQ-10.4, REQ-10.5).
+        logger.info(
+            "Indicator evaluation complete: close_time_ms=%s %%K=%.4f "
+            "%%D=%.4f decision=%r dispatched=%s",
+            reading.close_time_ms,
+            reading.k,
+            reading.d,
+            decision.value,
+            dispatched,
+            extra={"category": "INDICATOR"},
+        )
+        return
+
+    # Non-FIRE decision (SUPPRESS / RESET / QUIET): no alert dispatched. Emit the
+    # single INDICATOR record with the decision string for this candle (REQ-10.4,
+    # REQ-10.5).
+    logger.info(
+        "Indicator evaluation complete: close_time_ms=%s %%K=%.4f %%D=%.4f "
+        "decision=%r",
+        reading.close_time_ms,
+        reading.k,
+        reading.d,
+        decision.value,
+        extra={"category": "INDICATOR"},
+    )
+
+
+def on_open(state: MonitorState, ws: typing.Any) -> None:
+    # Purpose: WebSocket ``on_open`` callback; logs that a live kline session has
+    #   been established on the subscribed Binance stream.
+    # Inputs: ``state`` (shared MonitorState, bound first via functools.partial)
+    #   and ``ws`` (the WebSocketApp instance passed by the client library).
+    # Returns / side effects: returns None; emits one WS-category INFO record
+    #   including BINANCE_WS_URL (REQ-3.1, REQ-9.3).
+    """Handle WebSocket session establishment.
+
+    Purpose:
+        Mark the moment a live kline session opens so operators can correlate
+        reconnects with stream activity (REQ-3.1, REQ-9.3).
+
+    Inputs:
+        state: The shared :class:`MonitorState`, bound as the first positional
+            argument via ``functools.partial`` (see the state-binding convention
+            above). Not mutated here.
+        ws: The ``WebSocketApp`` instance supplied by the client library
+            (unused beyond logging).
+
+    Returns / side effects:
+        Returns ``None``. Emits one WS-category INFO record including the
+        subscribed :data:`BINANCE_WS_URL` (REQ-3.1).
+    """
+    logging.getLogger(LOGGER_NAME).info(
+        "WebSocket session opened on %s",
+        BINANCE_WS_URL,
+        extra={"category": "WS"},
+    )
+
+
+def on_message(state: MonitorState, ws: typing.Any, raw: str) -> None:
+    # Purpose: WebSocket ``on_message`` callback; parse an inbound kline payload
+    #   and forward only finalized (closed) candles to ``process_data``.
+    # Inputs: ``state`` (shared MonitorState, bound first via functools.partial),
+    #   ``ws`` (WebSocketApp instance), and ``raw`` (the raw message body string).
+    # Returns / side effects: returns None. Forwards to ``process_data`` only on
+    #   a closed candle (``"k.x" == True``); logs a WS WARNING on JSON parse
+    #   failure or a malformed closed kline; returns silently for non-closed
+    #   candles, missing ``"k"``, or missing ``"k.x"`` (REQ-3.3..REQ-3.7).
+    """Parse an inbound WebSocket message and route Closed_Candles downstream.
+
+    Purpose:
+        Implement the WebSocket_Client message handler from the design's Data
+        Flow: parse JSON, extract the ``"k"`` kline object, and forward a
+        :class:`Candle` to :func:`process_data` if and only if the kline is
+        closed (``"x" == True``). All other payloads are ignored, with malformed
+        JSON logged as a parse failure (REQ-3.3..REQ-3.7).
+
+    Inputs:
+        state: The shared :class:`MonitorState`, bound as the first positional
+            argument via ``functools.partial`` (see the state-binding convention
+            above). Passed through to :func:`process_data`.
+        ws: The ``WebSocketApp`` instance supplied by the client library
+            (unused).
+        raw: The raw message body (a JSON string) delivered by the stream.
+
+    Returns / side effects:
+        Returns ``None`` in every branch. Control flow:
+
+        1. ``json.loads(raw)``; on :class:`json.JSONDecodeError` log a
+           WS-category WARNING and return without forwarding (REQ-3.6).
+        2. Extract ``k = payload["k"]`` (only when ``payload`` is a dict). If the
+           kline object is missing or is not a dict, return silently (REQ-3.7).
+        3. If ``"x"`` is absent from the kline object, return silently (REQ-3.7).
+        4. If ``"x"`` is not ``True`` (a non-closed candle), return silently
+           without forwarding (REQ-3.4).
+        5. If ``"x"`` is ``True``, build a :class:`Candle` from the
+           ``t/o/h/l/c/v`` fields and call ``process_data(state, candle)``
+           (REQ-3.3, REQ-3.5). A malformed closed kline (missing or non-numeric
+           field) is caught, logged as a WS-category WARNING, and skipped rather
+           than crashing the Monitor (defensive, aligns with REQ-3.7).
+    """
+    logger = logging.getLogger(LOGGER_NAME)
+
+    # Step 1 -- parse the body as JSON. A non-JSON / truncated frame is logged
+    # once and skipped without forwarding any data downstream (REQ-3.6).
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning(
+            "Could not parse WebSocket message as JSON; skipping message.",
+            extra={"category": "WS"},
+        )
+        return
+
+    # Step 2 -- extract the kline object. Binance wraps the kline under "k". A
+    # payload that is not a dict, or that lacks "k", carries no kline object and
+    # is skipped silently (REQ-3.7).
+    k = payload.get("k") if isinstance(payload, dict) else None
+    if not isinstance(k, dict):
+        return
+
+    # Step 3 -- the kline object must carry the "x" (is-closed) flag; without it
+    # we cannot tell whether the candle is final, so skip silently (REQ-3.7).
+    if "x" not in k:
+        return
+
+    # Step 4 -- only finalized candles update the indicator. A non-closed candle
+    # (``"x" == False``) is intentionally NOT forwarded (REQ-3.4). Strict
+    # identity against ``True`` ignores non-closed / unexpected values.
+    if k["x"] is not True:
+        return
+
+    # Step 5 -- closed candle: build the immutable Candle from the kline fields
+    # (REQ-3.3) and forward it (REQ-3.5). Guard against a malformed closed kline
+    # (missing or non-numeric o/h/l/c/v/t): log + skip instead of crashing.
+    try:
+        candle = Candle(
+            open_time_ms=int(k["t"]),
+            open=float(k["o"]),
+            high=float(k["h"]),
+            low=float(k["l"]),
+            close=float(k["c"]),
+            volume=float(k["v"]),
+        )
+    except (KeyError, ValueError, TypeError) as exc:
+        logger.warning(
+            "Malformed closed kline payload (%s: %s); skipping message.",
+            type(exc).__name__,
+            exc,
+            extra={"category": "WS"},
+        )
+        return
+
+    process_data(state, candle)
+
+
+def on_close(
+    state: MonitorState,
+    ws: typing.Any,
+    code: int | None,
+    reason: str | None,
+) -> None:
+    # Purpose: WebSocket ``on_close`` callback; logs session termination so the
+    #   outer reconnection loop (task 12.1) can correlate disconnects.
+    # Inputs: ``state`` (shared MonitorState, bound first via functools.partial),
+    #   ``ws`` (WebSocketApp instance), ``code`` (close status code or None), and
+    #   ``reason`` (close reason text or None).
+    # Returns / side effects: returns None; emits one WS-category INFO record
+    #   including the close ``code`` and ``reason`` (REQ-8.6). The reconnection
+    #   loop owns the retry/backoff (REQ-8.7).
+    """Handle WebSocket session termination.
+
+    Purpose:
+        Record the close code and reason for each ended session so an operator
+        can diagnose disconnects; the outer ``run_forever`` reconnection loop
+        (task 12.1) is responsible for the actual retry (REQ-8.6, REQ-8.7).
+
+    Inputs:
+        state: The shared :class:`MonitorState`, bound as the first positional
+            argument via ``functools.partial`` (see the state-binding convention
+            above). Not mutated here -- the buffer and ``is_oversold`` lock are
+            deliberately preserved across the disconnect (REQ-8.4).
+        ws: The ``WebSocketApp`` instance supplied by the client library
+            (unused).
+        code: The WebSocket close status code (e.g. ``1006``), or ``None`` when
+            the library did not supply one.
+        reason: The close reason text, or ``None`` when not supplied.
+
+    Returns / side effects:
+        Returns ``None``. Emits one WS-category INFO record including ``code``
+        and ``reason`` (REQ-8.6).
+    """
+    logging.getLogger(LOGGER_NAME).info(
+        "WebSocket session closed (code=%r, reason=%r)",
+        code,
+        reason,
+        extra={"category": "WS"},
+    )
