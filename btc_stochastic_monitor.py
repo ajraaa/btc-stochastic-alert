@@ -21,9 +21,13 @@ import dataclasses
 import enum
 import json
 import logging
+import math
 import sys
 import time
 import typing
+
+# --- Third-party imports -----------------------------------------------------
+import pandas as pd
 
 # =============================================================================
 # Module-Level Constants
@@ -398,3 +402,118 @@ def update_buffer(buffer: list[Candle], candle: Candle) -> list[Candle]:
     # Discard case (REQ-4.5): earlier than the latest open time with no matching
     # entry. Leave the buffer untouched.
     return buffer
+
+
+# =============================================================================
+# Stochastic Oscillator Computation
+# =============================================================================
+
+
+def compute_stochastic(buffer: list[Candle]) -> StochasticReading | None:
+    """Compute the latest Stochastic Oscillator (%K, %D) over the candle buffer.
+
+    Purpose:
+        Recompute the Stochastic Oscillator with the configured parameters
+        (%K Length 5, %K Smoothing 3, %D Smoothing 3) on every Closed_Candle and
+        return the latest %K / %D values for the Trigger_Evaluator
+        (REQ-5.1..REQ-5.6).
+
+        This implementation uses NATIVE vanilla pandas ``.rolling()`` window
+        functions rather than ``pandas-ta``. The runtime targets Python 3.14+,
+        where ``numba`` (a ``pandas-ta`` build dependency) refuses to build, so
+        ``pandas-ta`` is deprecated entirely. The math below reproduces the same
+        STOCH(5, 3, 3) calculation and writes its results into the
+        :data:`STOCH_K_COL` / :data:`STOCH_D_COL` columns so the column names
+        stay meaningful and consistent with the rest of the Monitor (REQ-1.5).
+
+    Inputs:
+        buffer: The candle buffer, sorted strictly ascending by ``open_time_ms``
+            (the most recent candle is ``buffer[-1]``). At least ~8 candles are
+            needed before the smoothed %K / %D rows are non-NaN; shorter buffers
+            simply yield ``None`` (warm-up).
+
+    Returns / side effects:
+        Returns a :class:`StochasticReading` whose ``k`` and ``d`` are the
+        last-row values of the :data:`STOCH_K_COL` / :data:`STOCH_D_COL` columns,
+        ``close`` is the closing price of the most recent candle, and
+        ``close_time_ms`` is that candle's open time advanced by one interval
+        (REQ-5.2, REQ-5.3, REQ-5.6).
+
+        Returns ``None`` (skip trigger evaluation) when:
+
+        * either column is missing from the computed DataFrame, or
+        * the last-row %K or %D value is ``NaN``. NaN arises during warm-up and
+          also when ``high_max == low_min`` over the %K window (a flat-price
+          window makes the ``(close - low_min) / (high_max - low_min)`` division
+          ``0 / 0``), which must be treated as "skip" (REQ-5.4).
+
+        On any raised exception the computation is wrapped in ``try``/``except``:
+        a WARNING is logged under category ``INDICATOR`` via the shared Logger
+        and ``None`` is returned, so a single bad computation never terminates
+        the Monitor (REQ-5.5).
+    """
+    try:
+        # Build the OHLCV DataFrame from the buffer in chronological order so
+        # the last row corresponds to the most recently closed candle.
+        df = pd.DataFrame(
+            {
+                "open": [c.open for c in buffer],
+                "high": [c.high for c in buffer],
+                "low": [c.low for c in buffer],
+                "close": [c.close for c in buffer],
+                "volume": [c.volume for c in buffer],
+            }
+        )
+
+        # Native Stochastic Oscillator (5, 3, 3) via vanilla pandas rolling
+        # windows (no pandas-ta / numba). REQ-5.1.
+        # 1. Rolling low/high over the %K length window.
+        low_min = df["low"].rolling(window=STOCH_K_LENGTH).min()
+        high_max = df["high"].rolling(window=STOCH_K_LENGTH).max()
+        # 2. Fast %K. When high_max == low_min the denominator is 0, producing
+        #    NaN/inf; the NaN check below treats that flat-price window as skip
+        #    (REQ-5.4).
+        fast_k = 100 * ((df["close"] - low_min) / (high_max - low_min))
+        # 3. Smoothed %K (slow %K) = SMA of fast %K over the %K smoothing window.
+        stoch_k_series = fast_k.rolling(window=STOCH_K_SMOOTH).mean()
+        # 4. %D = SMA of smoothed %K over the %D smoothing window.
+        stoch_d_series = stoch_k_series.rolling(window=STOCH_D_SMOOTH).mean()
+
+        # Assign onto the DataFrame under the configured column names so the
+        # output columns stay meaningful and match the rest of the Monitor
+        # (REQ-1.5).
+        df[STOCH_K_COL] = stoch_k_series
+        df[STOCH_D_COL] = stoch_d_series
+
+        # Skip if either column is missing from the computed output (REQ-5.4).
+        if STOCH_K_COL not in df.columns or STOCH_D_COL not in df.columns:
+            return None
+
+        # Read the latest %K / %D from the last row (REQ-5.2, REQ-5.3).
+        latest_k = float(df[STOCH_K_COL].iloc[-1])
+        latest_d = float(df[STOCH_D_COL].iloc[-1])
+
+        # Skip when either value is NaN: warm-up rows or a flat-price window
+        # (high_max == low_min) yield NaN, which must suppress trigger
+        # evaluation (REQ-5.4).
+        if math.isnan(latest_k) or math.isnan(latest_d):
+            return None
+
+        # Success: forward the latest reading for trigger evaluation (REQ-5.6).
+        return StochasticReading(
+            k=latest_k,
+            d=latest_d,
+            close=buffer[-1].close,
+            close_time_ms=buffer[-1].open_time_ms + STALE_BUFFER_THRESHOLD_MS,
+        )
+    except Exception as exc:
+        # Log-and-continue: any failure computing the indicator skips trigger
+        # evaluation for this candle without terminating the Monitor (REQ-5.5).
+        logging.getLogger(LOGGER_NAME).warning(
+            "Stochastic computation failed (%s: %s); skipping trigger "
+            "evaluation for this candle",
+            type(exc).__name__,
+            exc,
+            extra={"category": "INDICATOR"},
+        )
+        return None

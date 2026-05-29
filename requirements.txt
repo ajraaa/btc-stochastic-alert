@@ -1,9 +1,10 @@
 # Runtime dependencies for the BTC Stochastic DCA Monitor.
 # Install all runtime deps with: pip install -r requirements.txt
 # (REQ-10.3)
-# NOTE: pandas-ta was removed; the Stochastic Oscillator is computed with
-# native pandas .rolling() window functions to avoid the numba/C build
-# dependency that fails on Python 3.14+.
+#
+# NOTE: pandas-ta was deprecated from the stack. Its transitive build
+# dependency (numba) blocks installation on Python 3.14+, so the Stochastic
+# Oscillator (5,3,3) is computed natively with vanilla pandas rolling windows.
 pandas>=2.3.3
 requests>=2.31.0
 websocket-client>=1.6.0
