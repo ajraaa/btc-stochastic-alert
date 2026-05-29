@@ -716,3 +716,183 @@ def send_telegram_notification(message: str) -> bool:
         extra={"category": "NOTIFY"},
     )
     return True
+
+
+# =============================================================================
+# Historical Data Bootstrapping
+# =============================================================================
+
+
+def bootstrap_history(state: MonitorState) -> None:
+    """Seed the candle buffer with recent historical 1-day klines from Binance.
+
+    Purpose:
+        Run the Bootstrapper at startup (and again on stale-buffer recovery) so
+        the Stochastic Oscillator has enough warm-up candles to produce finite
+        %K / %D values immediately, instead of waiting days for live candles to
+        accumulate (REQ-2.1..REQ-2.6). The Monitor opens the WebSocket_Client
+        only after this function returns, so a populated buffer is guaranteed
+        before live ingestion begins (REQ-2.4).
+
+    Inputs:
+        state: The shared :class:`MonitorState`. On success ``state.buffer`` is
+            replaced with the parsed historical candles in chronological order;
+            no other field is touched.
+
+    Returns / side effects:
+        Returns ``None`` once a single valid response has been parsed and
+        assigned to ``state.buffer``. Issues HTTPS GET requests to
+        :data:`BINANCE_REST_URL` with query parameters ``symbol=BTCUSDT``
+        (uppercase per REQ-2.1; the WebSocket stream uses the lowercase
+        :data:`SYMBOL`), ``interval=INTERVAL``, and ``limit=HISTORY_LIMIT``, with
+        a :data:`REST_TIMEOUT_S` request timeout.
+
+    Retry behaviour (REQ-2.5, REQ-2.6):
+        Loops until the first valid response. Each of the following failure
+        modes is logged distinctly as a BOOTSTRAP-category ERROR through the
+        shared Logger, followed by ``time.sleep(RECONNECT_DELAY_S)`` before the
+        next attempt:
+
+        * a network or timeout exception from ``requests.get``
+          (:class:`requests.RequestException`),
+        * a non-200 HTTP status code,
+        * a body that cannot be parsed as JSON,
+        * a parsed body that is not a JSON array (list),
+        * an array with fewer than 10 entries,
+        * a row that cannot be parsed into a :class:`Candle`
+          (``ValueError`` / ``IndexError`` / ``TypeError``).
+
+        Once a valid response is parsed the function assigns ``state.buffer`` and
+        returns immediately; it never issues an additional request after the
+        first success in a startup cycle (REQ-2.6).
+    """
+    logger = logging.getLogger(LOGGER_NAME)
+
+    # Minimum number of historical entries required before the buffer is
+    # considered usable for warm-up (REQ-2.2, REQ-2.5).
+    min_entries = 10
+
+    # Retry loop: keep requesting until one valid response is parsed. Every
+    # failure mode logs a BOOTSTRAP error, sleeps the Reconnect_Delay, and
+    # continues; success assigns the buffer and returns (REQ-2.5, REQ-2.6).
+    while True:
+        # --- Issue the request (REQ-2.1) -------------------------------------
+        # ``symbol`` is the uppercase "BTCUSDT" mandated by REQ-2.1 for the REST
+        # endpoint, distinct from the lowercase SYMBOL used by the WS stream.
+        try:
+            response = requests.get(
+                BINANCE_REST_URL,
+                params={
+                    "symbol": "BTCUSDT",
+                    "interval": INTERVAL,
+                    "limit": HISTORY_LIMIT,
+                },
+                timeout=REST_TIMEOUT_S,
+            )
+        except requests.RequestException as exc:
+            # Failure mode 1: network/timeout exception (REQ-2.5).
+            logger.error(
+                "Bootstrap request failed (%s: %s); retrying after %s s.",
+                type(exc).__name__,
+                exc,
+                RECONNECT_DELAY_S,
+                extra={"category": "BOOTSTRAP"},
+            )
+            time.sleep(RECONNECT_DELAY_S)
+            continue
+
+        # --- Failure mode 2: non-200 HTTP status (REQ-2.5) -------------------
+        if response.status_code != 200:
+            logger.error(
+                "Bootstrap request returned non-200 HTTP status %s; retrying "
+                "after %s s.",
+                response.status_code,
+                RECONNECT_DELAY_S,
+                extra={"category": "BOOTSTRAP"},
+            )
+            time.sleep(RECONNECT_DELAY_S)
+            continue
+
+        # --- Failure mode 3: body not parseable as JSON (REQ-2.5) ------------
+        try:
+            payload = response.json()
+        except (ValueError, json.JSONDecodeError) as exc:
+            logger.error(
+                "Bootstrap response body is not valid JSON (%s: %s); retrying "
+                "after %s s.",
+                type(exc).__name__,
+                exc,
+                RECONNECT_DELAY_S,
+                extra={"category": "BOOTSTRAP"},
+            )
+            time.sleep(RECONNECT_DELAY_S)
+            continue
+
+        # --- Failure mode 4: parsed JSON is not an array (REQ-2.5) -----------
+        if not isinstance(payload, list):
+            logger.error(
+                "Bootstrap response JSON is not an array (got %s); retrying "
+                "after %s s.",
+                type(payload).__name__,
+                RECONNECT_DELAY_S,
+                extra={"category": "BOOTSTRAP"},
+            )
+            time.sleep(RECONNECT_DELAY_S)
+            continue
+
+        # --- Failure mode 5: fewer than 10 entries (REQ-2.5) -----------------
+        if len(payload) < min_entries:
+            logger.error(
+                "Bootstrap response array has only %s entries (need at least "
+                "%s); retrying after %s s.",
+                len(payload),
+                min_entries,
+                RECONNECT_DELAY_S,
+                extra={"category": "BOOTSTRAP"},
+            )
+            time.sleep(RECONNECT_DELAY_S)
+            continue
+
+        # --- Parse rows into Candles (REQ-2.3) -------------------------------
+        # Each Binance kline row is a list like
+        # [openTime(int ms), open(str), high(str), low(str), close(str),
+        #  volume(str), closeTime, ...]. Convert defensively; a malformed row
+        # (short list, non-numeric field) raises ValueError/IndexError/
+        # TypeError and is treated as a failure mode -> log + sleep + retry.
+        try:
+            candles = [
+                Candle(
+                    open_time_ms=int(row[0]),
+                    open=float(row[1]),
+                    high=float(row[2]),
+                    low=float(row[3]),
+                    close=float(row[4]),
+                    volume=float(row[5]),
+                )
+                for row in payload
+            ]
+        except (ValueError, IndexError, TypeError) as exc:
+            logger.error(
+                "Bootstrap response row could not be parsed into a Candle "
+                "(%s: %s); retrying after %s s.",
+                type(exc).__name__,
+                exc,
+                RECONNECT_DELAY_S,
+                extra={"category": "BOOTSTRAP"},
+            )
+            time.sleep(RECONNECT_DELAY_S)
+            continue
+
+        # --- Success (REQ-2.2, REQ-2.6) --------------------------------------
+        # Sort ascending by open time so the buffer satisfies the chronological
+        # invariant shared with ``update_buffer`` (REQ-4.3), then assign and
+        # return without issuing any further request this startup cycle.
+        candles.sort(key=lambda c: c.open_time_ms)
+        state.buffer = candles
+        logger.info(
+            "Bootstrap succeeded: seeded candle buffer with %s historical "
+            "candles.",
+            len(candles),
+            extra={"category": "BOOTSTRAP"},
+        )
+        return
