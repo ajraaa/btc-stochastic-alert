@@ -74,3 +74,116 @@ TELEGRAM_TIMEOUT_S = 10  # Telegram sendMessage (REQ-7.1).
 # Binance endpoints.
 BINANCE_REST_URL = "https://api.binance.com/api/v3/klines"  # REST klines (REQ-2.1).
 BINANCE_WS_URL = f"wss://stream.binance.com:9443/ws/{SYMBOL}@kline_{INTERVAL}"  # WS stream (REQ-3.1).
+
+# Default event category applied to any log record whose caller did not supply
+# an explicit ``extra={"category": ...}`` value. Keeping a fallback here means a
+# plain ``logger.info("msg")`` call still formats cleanly instead of raising a
+# ``KeyError`` on the ``%(category)s`` placeholder (REQ-11.5).
+DEFAULT_LOG_CATEGORY = "MONITOR"
+
+# Logger name shared by every component so they all resolve the same configured
+# Logger via ``logging.getLogger(LOGGER_NAME)`` (REQ-11.6).
+LOGGER_NAME = "btc_stochastic_monitor"
+
+# Formatter pattern and ISO-8601 date format. ``asctime`` is rendered with the
+# ``datefmt`` below (UTC via ``time.gmtime``) and the ``.%(msecs)03dZ`` suffix
+# appends millisecond precision plus the ``Z`` UTC designator, yielding e.g.
+# ``2024-01-01T00:00:00.123Z`` (REQ-11.5).
+_LOG_FORMAT = "%(asctime)s.%(msecs)03dZ [%(category)s] %(levelname)s %(message)s"
+_LOG_DATEFMT = "%Y-%m-%dT%H:%M:%S"
+
+
+# =============================================================================
+# Logger
+# =============================================================================
+
+
+class _UtcCategoryFormatter(logging.Formatter):
+    """Formatter that renders UTC timestamps and tolerates a missing category.
+
+    Two behaviours layer on top of the stdlib :class:`logging.Formatter`:
+
+    * ``converter`` is set to :func:`time.gmtime` so ``asctime`` is always UTC,
+      independent of the host's local timezone (REQ-11.5).
+    * Any record lacking a ``category`` attribute (a caller that omitted
+      ``extra={"category": ...}``) is given :data:`DEFAULT_LOG_CATEGORY` before
+      formatting, so the ``%(category)s`` placeholder never raises. Callers that
+      *do* pass ``extra={"category": "WS"}`` keep their value untouched, so both
+      ``logger.info("msg")`` and ``logger.info("msg", extra={"category": "WS"})``
+      format without error.
+    """
+
+    converter = time.gmtime  # UTC timestamps (REQ-11.5).
+
+    def format(self, record: logging.LogRecord) -> str:
+        if not hasattr(record, "category"):
+            # Inject the fallback category for un-categorized records so the
+            # ``%(category)s`` field always resolves (REQ-11.5).
+            record.category = DEFAULT_LOG_CATEGORY
+        return super().format(record)
+
+
+def init_logger(log_path: str) -> logging.Logger:
+    """Initialize and return the Monitor's centralized Logger.
+
+    Purpose:
+        Configure a single ``logging.Logger`` (named :data:`LOGGER_NAME`) that
+        fans every record out to standard output and to a backup log file, with
+        a UTC-timestamped, category-tagged formatter (REQ-11.1..REQ-11.5).
+
+    Inputs:
+        log_path: Filesystem path for the backup log file's ``FileHandler``
+            (the Backup_Log_File, REQ-1.8, REQ-11.3).
+
+    Returns / side effects:
+        Returns the configured ``logging.Logger``. Attaches a
+        ``StreamHandler(sys.stdout)`` and, when it can be opened, a
+        ``FileHandler(log_path)``; both share one :class:`_UtcCategoryFormatter`.
+        If the ``FileHandler`` cannot be opened (e.g. permission denied or a
+        missing directory), the Logger logs a one-time WARNING through the
+        StreamHandler and degrades to StreamHandler-only rather than crashing
+        (REQ-11.7). Existing handlers are cleared first so repeated calls do not
+        accumulate duplicate handlers.
+    """
+    logger = logging.getLogger(LOGGER_NAME)
+    logger.setLevel(logging.INFO)
+
+    # Clear any handlers from a previous init_logger call so repeated
+    # invocations don't fan a single record out through duplicate handlers.
+    for existing in list(logger.handlers):
+        logger.removeHandler(existing)
+        try:
+            existing.close()
+        except Exception:  # pragma: no cover - defensive cleanup only
+            pass
+
+    formatter = _UtcCategoryFormatter(fmt=_LOG_FORMAT, datefmt=_LOG_DATEFMT)
+    # Belt-and-suspenders: the class attribute already sets UTC conversion, but
+    # set it on the instance too so the contract is explicit (REQ-11.5).
+    formatter.converter = time.gmtime
+
+    # StreamHandler (stdout) is attached first so it is available to report a
+    # FileHandler degradation through the Logger itself (REQ-11.2, REQ-11.7).
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+
+    # FileHandler (Backup_Log_File). A permission error or missing directory
+    # raises OSError; degrade to StreamHandler-only instead of crashing
+    # (REQ-11.3, REQ-11.7).
+    try:
+        file_handler = logging.FileHandler(log_path, encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+    except OSError as exc:
+        # One-time WARNING emitted via the already-attached StreamHandler so the
+        # operator learns persistence is disabled, without terminating the
+        # Monitor (REQ-11.7).
+        logger.warning(
+            "FileHandler init failed for %r (%s); continuing with stdout only",
+            log_path,
+            exc,
+            extra={"category": "STARTUP"},
+        )
+
+    return logger
