@@ -188,3 +188,75 @@ def test_property9_logger_fanout_and_formatting(tmp_path, caplog, level, categor
     assert len(captured) == 1, "expected exactly one captured record for the category"
     assert captured[0].levelno == level
     assert captured[0].getMessage() == message
+
+
+# ---------------------------------------------------------------------------
+# Unit test: FileHandler degradation (StreamHandler-only fallback)
+# Validates: Requirements 11.7
+# ---------------------------------------------------------------------------
+def test_filehandler_permission_error_degrades_to_stdout_only(tmp_path, caplog, monkeypatch):
+    """``init_logger`` degrades to StreamHandler-only when the FileHandler fails.
+
+    **Validates: Requirements 11.7**
+
+    When the backup log file cannot be opened (here simulated by forcing
+    ``logging.FileHandler.__init__`` to raise ``PermissionError`` -- a subclass
+    of the ``OSError`` that ``init_logger`` catches), the returned Logger must:
+
+    * not propagate the exception (``init_logger`` does not raise),
+    * carry exactly one handler -- the stdout ``StreamHandler`` that is NOT a
+      ``FileHandler``, and
+    * have emitted a single WARNING explaining the degradation (logged under the
+      ``STARTUP`` event category via the already-attached StreamHandler).
+    """
+    # Force FileHandler construction to fail exactly as a non-writable backup
+    # path would. PermissionError <: OSError, so init_logger's ``except OSError``
+    # branch (the degradation path) is exercised.
+    def _raise_permission_error(self, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(logging.FileHandler, "__init__", _raise_permission_error)
+
+    log_path = tmp_path / "unwritable" / "monitor.log"
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger=bsm.LOGGER_NAME):
+        # Must NOT raise even though the FileHandler cannot be constructed.
+        logger = bsm.init_logger(str(log_path))
+
+    # --- A usable Logger is returned ---------------------------------------
+    assert isinstance(logger, logging.Logger)
+
+    # --- Exactly one handler, the StreamHandler (never a FileHandler) -------
+    assert len(logger.handlers) == 1, (
+        f"expected the degraded Logger to keep a single handler, "
+        f"found {len(logger.handlers)}"
+    )
+    stream_handler = _find_stream_handler(logger)  # asserts a lone non-file StreamHandler
+    assert not isinstance(stream_handler, logging.FileHandler)
+    assert not any(isinstance(h, logging.FileHandler) for h in logger.handlers), (
+        "degraded Logger must not retain any FileHandler"
+    )
+
+    # --- A single WARNING explaining the degradation was emitted (STARTUP) --
+    degradation_warnings = [
+        record
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+        and getattr(record, "category", None) == "STARTUP"
+    ]
+    assert len(degradation_warnings) == 1, (
+        "expected exactly one STARTUP-category WARNING describing the "
+        f"FileHandler degradation, found {len(degradation_warnings)}"
+    )
+
+    # The message should explain what degraded (the FileHandler) and that the
+    # Monitor continues via stdout -- robust to minor wording changes by
+    # matching the salient, lower-cased tokens rather than the exact string.
+    warning_message = degradation_warnings[0].getMessage().lower()
+    assert "filehandler" in warning_message, (
+        f"degradation WARNING should mention the FileHandler: {warning_message!r}"
+    )
+    assert "stdout" in warning_message, (
+        f"degradation WARNING should mention continuing on stdout: {warning_message!r}"
+    )
