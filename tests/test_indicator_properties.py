@@ -29,6 +29,7 @@ test (task 6.3) can reuse the same candle / buffer generators.
 from __future__ import annotations
 
 import math
+from unittest.mock import MagicMock
 
 import pandas as pd
 import pytest
@@ -225,3 +226,227 @@ def test_property3_stochastic_uses_configured_columns_and_parameters(
     # close / close_time_ms are taken from the most recent candle (REQ-5.6).
     assert reading.close == buffer[-1].close
     assert reading.close_time_ms == buffer[-1].open_time_ms + bsm.STALE_BUFFER_THRESHOLD_MS
+
+
+# ---------------------------------------------------------------------------
+# Property 4: NaN or missing columns suppress trigger evaluation
+# Validates: Requirements 5.4
+# ---------------------------------------------------------------------------
+#
+# REQ-5.4: "IF the latest %K value or the latest %D value is NaN, OR the column
+# STOCHk_5_3_3 or the column STOCHd_5_3_3 is missing from the output, THEN THE
+# Indicator_Engine SHALL skip trigger evaluation for the current Closed_Candle."
+#
+# In the NATIVE (vanilla pandas) implementation the columns are always created,
+# so the realistic "skip" trigger is a NaN in the last row. Two distinct ways to
+# force a NaN last row are exercised below:
+#
+#   1. Warm-up: STOCH(5, 3, 3) needs 5 + (3-1) + (3-1) = 9 candles before the
+#      last-row %D is non-NaN. Any buffer of 1..8 finite candles yields a NaN
+#      last row -> compute_stochastic returns None.
+#   2. Flat window: a buffer of >= 9 candles whose last 5 candles share the same
+#      high == low makes high_max == low_min over the %K window, so the
+#      (close - low_min) / (high_max - low_min) division is 0/0 -> NaN -> None.
+#
+# The "skip trigger evaluation" contract is then demonstrated with the documented
+# gating pattern: a mocked ``evaluate_trigger`` stand-in is invoked only when
+# ``compute_stochastic`` returns a non-None reading, and is asserted to be never
+# called when the reading is None.
+
+
+# A buffer that is too short for STOCH(5, 3, 3) to produce a non-NaN last row.
+# 9 candles are required (5 + 2 + 2); sizes 1..8 are all still in warm-up.
+_WARMUP_MAX_SIZE = 8
+
+
+@settings(max_examples=100, deadline=None)
+@given(buffer=buffer_strategy(min_size=1, max_size=_WARMUP_MAX_SIZE))
+def test_property4_warmup_short_buffer_returns_none(buffer: list[Candle]) -> None:
+    """**Property 4: NaN or missing columns suppress trigger evaluation** (warm-up)
+
+    **Validates: Requirements 5.4**
+
+    For any candle buffer too short for STOCH(5, 3, 3) warm-up (1..8 finite
+    candles), the last-row smoothed %K / %D are NaN, so ``compute_stochastic``
+    returns ``None`` and trigger evaluation is skipped for the candle.
+    """
+    # Sanity: these buffers are genuinely below the 9-candle warm-up boundary.
+    assert len(buffer) <= _WARMUP_MAX_SIZE
+
+    reading = compute_stochastic(buffer)
+
+    assert reading is None, (
+        "compute_stochastic must return None for a warm-up-length buffer "
+        f"(len={len(buffer)}) whose last-row %K/%D are NaN (REQ-5.4)"
+    )
+
+    # Demonstrate the gate (REQ-5.4): a mocked evaluate_trigger stand-in is only
+    # invoked when the reading is non-None. With reading is None it must NOT be
+    # called, i.e. trigger evaluation is skipped for the candle.
+    mock_evaluate_trigger = MagicMock()
+    if reading is not None:
+        mock_evaluate_trigger(reading)
+    mock_evaluate_trigger.assert_not_called()
+
+
+def _flat_last_window_buffer(total: int = 12, window: int = bsm.STOCH_K_LENGTH) -> list[Candle]:
+    """Build a buffer of ``total`` candles whose final ``window`` candles are flat.
+
+    The last ``window`` candles all share an identical ``high == low`` price, so
+    over the trailing %K window ``high_max == low_min`` and the fast %K division
+    is ``0 / 0`` -> NaN. With ``total >= 9`` the buffer is past warm-up, isolating
+    the flat-window NaN (rather than the warm-up NaN) as the cause of the skip.
+    """
+    candles: list[Candle] = []
+    # Leading, non-degenerate candles (varied highs/lows) so the buffer is well
+    # past the 9-candle warm-up boundary.
+    for i in range(total - window):
+        base = 100.0 + i
+        candles.append(
+            Candle(
+                open_time_ms=i,
+                open=base,
+                high=base + 5.0,
+                low=base - 5.0,
+                close=base + 1.0,
+                volume=10.0,
+            )
+        )
+    # Trailing flat window: identical high == low == close makes the rolling
+    # high_max == low_min over the last %K window, forcing a 0/0 NaN last row.
+    flat_price = 500.0
+    for j in range(window):
+        idx = (total - window) + j
+        candles.append(
+            Candle(
+                open_time_ms=idx,
+                open=flat_price,
+                high=flat_price,
+                low=flat_price,
+                close=flat_price,
+                volume=10.0,
+            )
+        )
+    return candles
+
+
+def test_property4_flat_window_returns_none() -> None:
+    """**Property 4: NaN or missing columns suppress trigger evaluation** (flat window)
+
+    **Validates: Requirements 5.4**
+
+    For a buffer past warm-up (>= 9 candles) whose final %K-length window is flat
+    (``high == low`` for every candle in the window), the fast-%K denominator
+    ``high_max - low_min`` is 0, so the last-row %K / %D are NaN and
+    ``compute_stochastic`` returns ``None``.
+    """
+    buffer = _flat_last_window_buffer(total=12)
+    # Past warm-up: the None here is due to the flat window, not too few candles.
+    assert len(buffer) >= 9
+
+    reading = compute_stochastic(buffer)
+
+    assert reading is None, (
+        "compute_stochastic must return None when the trailing %K window is flat "
+        "(high_max == low_min -> 0/0 NaN), suppressing trigger evaluation (REQ-5.4)"
+    )
+
+    # Gate demonstration: reading is None, so evaluate_trigger is never invoked.
+    mock_evaluate_trigger = MagicMock()
+    if reading is not None:
+        mock_evaluate_trigger(reading)
+    mock_evaluate_trigger.assert_not_called()
+
+
+def test_property4_missing_column_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """**Property 4: NaN or missing columns suppress trigger evaluation** (missing column)
+
+    **Validates: Requirements 5.4**
+
+    Exercises the "column missing from output" skip branch of
+    ``compute_stochastic``. The native implementation always assigns the
+    configured columns, so to reach the ``STOCH_K_COL not in df.columns`` guard
+    we patch ``bsm.pd.DataFrame`` with a thin subclass whose ``__setitem__``
+    silently drops any attempt to create the ``STOCH_K_COL`` column. The
+    indicator's computed DataFrame therefore lacks the expected %K column,
+    ``compute_stochastic`` returns ``None``, and trigger evaluation is skipped.
+    """
+
+    class _DropKColumnDataFrame(pd.DataFrame):
+        """DataFrame that refuses to store the configured %K column.
+
+        ``__setitem__`` ignores writes whose key equals the (current) configured
+        :data:`STOCH_K_COL`, so after ``compute_stochastic`` assigns its results
+        the %K column is absent from the frame, driving the missing-column guard.
+        """
+
+        # Required so pandas operations that construct new frames return the
+        # base class rather than this test-only subclass.
+        @property
+        def _constructor(self):  # type: ignore[override]
+            return pd.DataFrame
+
+        def __setitem__(self, key, value):  # type: ignore[override]
+            if key == bsm.STOCH_K_COL:
+                return  # drop the %K column write so the column stays missing
+            super().__setitem__(key, value)
+
+    monkeypatch.setattr(bsm.pd, "DataFrame", _DropKColumnDataFrame)
+
+    # A buffer comfortably past warm-up so the only reason for None is the
+    # missing %K column, not a NaN warm-up row.
+    buffer = [
+        Candle(
+            open_time_ms=i,
+            open=100.0 + i,
+            high=110.0 + i,
+            low=90.0 + i,
+            close=100.0 + (i % 3),
+            volume=10.0,
+        )
+        for i in range(15)
+    ]
+
+    reading = compute_stochastic(buffer)
+
+    assert reading is None, (
+        "compute_stochastic must return None when the configured %K column is "
+        "absent from the computed output (REQ-5.4)"
+    )
+
+    # Gate demonstration: reading is None, so evaluate_trigger is never invoked.
+    mock_evaluate_trigger = MagicMock()
+    if reading is not None:
+        mock_evaluate_trigger(reading)
+    mock_evaluate_trigger.assert_not_called()
+
+
+def test_property4_gate_invokes_trigger_when_reading_present() -> None:
+    """Control: when ``compute_stochastic`` DOES return a reading, the gate fires.
+
+    Confirms the gating pattern used in the Property 4 assertions is meaningful:
+    given a healthy, past-warm-up buffer with non-degenerate prices,
+    ``compute_stochastic`` returns a non-``None`` reading and the mocked
+    ``evaluate_trigger`` stand-in IS invoked exactly once with that reading. Without
+    this control the ``assert_not_called`` checks could pass vacuously.
+    """
+    # A varied, past-warm-up buffer that yields finite %K / %D.
+    buffer = [
+        Candle(
+            open_time_ms=i,
+            open=100.0 + (i % 7),
+            high=110.0 + (i % 5),
+            low=90.0 - (i % 3),
+            close=95.0 + (i % 11),
+            volume=10.0,
+        )
+        for i in range(20)
+    ]
+
+    reading = compute_stochastic(buffer)
+    assert reading is not None, "control buffer should yield a finite reading"
+
+    mock_evaluate_trigger = MagicMock()
+    if reading is not None:
+        mock_evaluate_trigger(reading)
+    mock_evaluate_trigger.assert_called_once_with(reading)
