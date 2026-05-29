@@ -1352,3 +1352,83 @@ def run_forever(state: MonitorState) -> None:
             extra={"category": "RECONNECT"},
         )
         time.sleep(RECONNECT_DELAY_S)
+
+
+# =============================================================================
+# Monitor Entry Point
+# =============================================================================
+
+
+def main() -> None:
+    """Run the Monitor's top-level startup sequence, then loop forever.
+
+    Purpose:
+        Orchestrate the one-time startup half of the design's Reconnection Flow
+        and hand control to the persistent runtime loop. ``main`` is the single
+        entry point invoked under the ``__main__`` guard at the bottom of this
+        file (REQ-9.4, REQ-10.1).
+
+    Inputs:
+        None. Reads the module-level constants (credentials, endpoints, the
+        Backup_Log_File path) declared at the top of the file.
+
+    Returns / side effects:
+        Does not return under normal operation -- the final ``run_forever`` call
+        is an infinite loop; the process ends only via a fatal configuration
+        error (``validate_config`` -> ``sys.exit(1)``) or an operator signal (see
+        design "Termination Conditions"). The startup sequence is, in order:
+
+        1. Create the single shared :class:`MonitorState` with an empty candle
+           buffer; the buffer and ``is_oversold`` Cool_Down_Lock live here so
+           they survive WebSocket session restarts (REQ-8.4).
+        2. ``validate_config()`` FIRST, before any logging or network call, so an
+           unsupported Python version or missing/empty Telegram credentials
+           fail fast and terminate before a socket is opened (REQ-1.9, REQ-10.2).
+        3. ``state.logger = init_logger(BACKUP_LOG_FILE)`` to configure the
+           centralized Logger (StreamHandler + FileHandler) before any component
+           emits a record (REQ-11.1).
+        4. Emit one STARTUP-category INFO record marking startup completion,
+           including the symbol and interval for operator context (REQ-10.4).
+        5. ``bootstrap_history(state)`` to seed the candle buffer from Binance
+           REST so the indicator has warm-up data before live ingestion (REQ-2).
+        6. ``run_forever(state)`` to enter the persistent WebSocket reconnection
+           loop for the lifetime of the process (REQ-8.1).
+    """
+    # Step 1 -- create the single shared MonitorState up front with an empty
+    # buffer; bootstrap_history populates it and the WS callbacks mutate it
+    # across sessions (REQ-8.4).
+    state = MonitorState(buffer=[])
+
+    # Step 2 -- fail-fast validation BEFORE any logging or network connection so
+    # an unsupported runtime or missing credentials terminate immediately
+    # (REQ-1.9, REQ-10.1, REQ-10.2).
+    validate_config()
+
+    # Step 3 -- configure the centralized Logger before any component logs a
+    # record (REQ-11.1); store it on the shared state for completeness.
+    state.logger = init_logger(BACKUP_LOG_FILE)
+
+    # Step 4 -- emit the startup-completion record (REQ-10.4). Logged through the
+    # shared Logger via its module-level name so the StreamHandler + FileHandler
+    # fan-out applies (REQ-11.6); include symbol/interval for operator context.
+    state.logger.info(
+        "Monitor startup complete; beginning bootstrap for %s @ %s.",
+        SYMBOL,
+        INTERVAL,
+        extra={"category": "STARTUP"},
+    )
+
+    # Step 5 -- seed the candle buffer from Binance REST so the Stochastic
+    # Oscillator has warm-up data before live candles arrive (REQ-2).
+    bootstrap_history(state)
+
+    # Step 6 -- enter the persistent reconnection loop for the lifetime of the
+    # process (REQ-8.1). This call does not return under normal operation.
+    run_forever(state)
+
+
+# Module guard: run the Monitor only when executed as a script, not on import.
+# Keeping ``main()`` behind this guard lets the test suite import the module to
+# exercise individual functions without launching the network loop (REQ-10.1).
+if __name__ == "__main__":
+    main()
