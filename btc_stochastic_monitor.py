@@ -333,3 +333,68 @@ class MonitorState:
     buffer: list[Candle]  # bounded, chronological candle buffer (REQ-2.2, REQ-4)
     is_oversold: bool = False  # Cool_Down_Lock, starts False (REQ-6.1)
     logger: logging.Logger | None = None  # shared Logger, set in main()
+
+
+# =============================================================================
+# Candle Buffer Management
+# =============================================================================
+
+
+def update_buffer(buffer: list[Candle], candle: Candle) -> list[Candle]:
+    """Update the bounded, chronological candle buffer with a Closed_Candle.
+
+    Purpose:
+        Apply one of three mutually exclusive operations to the candle buffer
+        when a Closed_Candle arrives, preserving the buffer invariants
+        (REQ-4.1..REQ-4.5, REQ-1.6). The buffer is kept sorted strictly
+        ascending by ``open_time_ms`` with unique open times and a length capped
+        at :data:`HISTORY_LIMIT` (50).
+
+    Inputs:
+        buffer: The current candle buffer, sorted strictly ascending by
+            ``open_time_ms`` with unique open times (may be empty).
+        candle: The incoming Closed_Candle to apply.
+
+    Returns / side effects:
+        Returns the resulting buffer (mutated in place). The applied operation
+        depends on ``candle.open_time_ms`` relative to the existing entries:
+
+        * Replace (REQ-4.4): when an existing entry shares the same
+          ``open_time_ms``, that entry is overwritten with ``candle`` in place,
+          leaving the buffer length and ordering unchanged.
+        * Append (REQ-4.1): when ``candle.open_time_ms`` is strictly greater
+          than every existing entry's open time (always true for an empty
+          buffer), ``candle`` is appended to the end. Leading (oldest) entries
+          are then dropped until ``len(buffer) <= HISTORY_LIMIT`` (REQ-4.2).
+        * Discard (REQ-4.5): when ``candle.open_time_ms`` is earlier than the
+          latest open time and no existing entry shares its open time, the
+          buffer is returned unchanged.
+
+        Strict ascending order by ``open_time_ms`` is maintained across every
+        operation (REQ-4.3).
+    """
+    new_open_time = candle.open_time_ms
+
+    # Replace case (REQ-4.4): an entry with the same open time already exists.
+    # Overwrite it in place so the buffer length and ordering are unchanged.
+    # This is checked first because a matching open time takes precedence over
+    # the "earlier than latest" discard rule (REQ-4.5).
+    for index, existing in enumerate(buffer):
+        if existing.open_time_ms == new_open_time:
+            buffer[index] = candle
+            return buffer
+
+    # Append case (REQ-4.1): strictly newer than every existing candle. The
+    # buffer is sorted ascending, so the latest open time is buffer[-1]; an
+    # empty buffer satisfies the condition vacuously.
+    if not buffer or new_open_time > buffer[-1].open_time_ms:
+        buffer.append(candle)
+        # Trim oldest (leading) entries until the bounded-length invariant holds
+        # (REQ-4.2, REQ-1.6).
+        while len(buffer) > HISTORY_LIMIT:
+            buffer.pop(0)
+        return buffer
+
+    # Discard case (REQ-4.5): earlier than the latest open time with no matching
+    # entry. Leave the buffer untouched.
+    return buffer
