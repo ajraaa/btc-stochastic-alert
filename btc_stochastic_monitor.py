@@ -517,3 +517,75 @@ def compute_stochastic(buffer: list[Candle]) -> StochasticReading | None:
             extra={"category": "INDICATOR"},
         )
         return None
+
+
+# =============================================================================
+# Cool-Down Trigger State Machine
+# =============================================================================
+
+
+def evaluate_trigger(state: MonitorState, reading: StochasticReading) -> TriggerDecision:
+    """Evaluate the oversold cool-down state machine for one Stochastic reading.
+
+    Purpose:
+        Decide, for a single forwarded :class:`StochasticReading`, whether the
+        Monitor should fire an oversold alert, suppress under the active
+        Cool_Down_Lock, release the lock, or stay quiet (REQ-6.1..REQ-6.5).
+        This is a PURE state-machine function over the pair
+        ``(state.is_oversold, reading.k)``: its only side effect is the
+        documented mutation of ``state.is_oversold`` below. It does NOT send
+        notifications or emit log records; the caller ``process_data`` is
+        responsible for logging the decision and dispatching the alert.
+
+    Inputs:
+        state: The shared :class:`MonitorState`; only ``state.is_oversold`` (the
+            boolean Cool_Down_Lock, REQ-6.1) is read and possibly mutated.
+        reading: The latest :class:`StochasticReading`; only ``reading.k`` (the
+            latest %K value) participates in the decision.
+
+    Returns / side effects:
+        Returns the :class:`TriggerDecision` for this reading. The four cases
+        are mutually exclusive and total over ``(is_oversold, k)``:
+
+        * ``FIRE`` — engagement: ``k < OVERSOLD_THRESHOLD`` and not yet oversold;
+          mutates ``state.is_oversold = True`` (REQ-6.2). Engagement uses strict
+          ``<`` so ``k == OVERSOLD_THRESHOLD`` does NOT fire.
+        * ``SUPPRESS`` — already oversold and ``k <= OVERSOLD_THRESHOLD``; no
+          state mutation (REQ-6.3).
+        * ``RESET`` — already oversold and ``k > OVERSOLD_THRESHOLD``; mutates
+          ``state.is_oversold = False`` (REQ-6.4). Release uses strict ``>`` so
+          ``k == OVERSOLD_THRESHOLD`` does NOT reset.
+        * ``QUIET`` — none of the above (not oversold and ``k >= threshold``); no
+          state mutation.
+
+        The trigger is evaluated only after the Indicator_Engine has completed
+        evaluation for a Closed_Candle (REQ-6.5); ``process_data`` enforces that
+        ordering by calling this function only on a non-``None`` reading.
+    """
+    # Engagement (REQ-6.2): %K is strictly below the threshold and the
+    # Cool_Down_Lock is currently disengaged. Engage the lock and fire exactly
+    # one alert. Strict ``<`` means k == OVERSOLD_THRESHOLD does NOT fire.
+    # Resulting state: is_oversold transitions False -> True.
+    if not state.is_oversold and reading.k < OVERSOLD_THRESHOLD:
+        state.is_oversold = True  # lock engaged; suppresses further alerts
+        return TriggerDecision.FIRE
+
+    # Suppression check (REQ-6.3): the lock is already engaged and %K is still at
+    # or below the threshold (``<=``, so the boundary k == OVERSOLD_THRESHOLD
+    # suppresses rather than resets). Stay silent without mutating state.
+    # Resulting state: is_oversold unchanged (remains True).
+    if state.is_oversold and reading.k <= OVERSOLD_THRESHOLD:
+        return TriggerDecision.SUPPRESS
+
+    # Reset (REQ-6.4): the lock is engaged and %K has risen strictly above the
+    # threshold (``>``, so k == OVERSOLD_THRESHOLD does NOT reset). Release the
+    # lock so the next oversold crossing can fire again.
+    # Resulting state: is_oversold transitions True -> False.
+    if state.is_oversold and reading.k > OVERSOLD_THRESHOLD:
+        state.is_oversold = False  # lock released; re-armed for next episode
+        return TriggerDecision.RESET
+
+    # Quiet: not oversold and %K is at or above the threshold. No oversold
+    # condition and no state change.
+    # Resulting state: is_oversold unchanged (remains False).
+    return TriggerDecision.QUIET
