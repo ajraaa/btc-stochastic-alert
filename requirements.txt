@@ -1,0 +1,7 @@
+# Runtime dependencies for the BTC Stochastic DCA Monitor.
+# Install all runtime deps with: pip install -r requirements.txt
+# (REQ-10.3)
+pandas>=2.0,<3.0
+pandas-ta>=0.3.14b0,<0.4
+requests>=2.31,<3.0
+websocket-client>=1.6,<2.0

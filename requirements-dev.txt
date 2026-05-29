@@ -1,0 +1,17 @@
+# Development / test-suite dependencies for the BTC Stochastic DCA Monitor.
+#
+# This manifest is for LOCAL DEVELOPMENT and CI ONLY. It is NOT deployed to the
+# VPS that runs the Monitor. The production runtime only needs the packages in
+# requirements.txt; installing these test tools on the VPS is unnecessary.
+#
+# Usage (local dev / CI):
+#   pip install -r requirements-dev.txt
+#
+# pytest    - test runner for unit, property, and integration tests
+# hypothesis - property-based testing engine
+# responses - HTTP mocking for the `requests` library
+# freezegun - time freezing/manipulation for reconnect and retry tests
+pytest
+hypothesis
+responses
+freezegun
