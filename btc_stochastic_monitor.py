@@ -19,6 +19,7 @@ from __future__ import annotations  # Enable PEP 604 type hints under Python 3.1
 # --- Standard library imports ------------------------------------------------
 import dataclasses
 import enum
+import functools  # binds MonitorState to WS callbacks in run_forever (REQ-8.2)
 import json
 import logging
 import math
@@ -29,6 +30,12 @@ import typing
 # --- Third-party imports -----------------------------------------------------
 import pandas as pd
 import requests  # Telegram Bot HTTP API client for the Notifier (REQ-7.4)
+
+# WebSocketApp is imported to module scope (rather than referenced as
+# ``websocket.WebSocketApp``) so ``run_forever`` can call ``WebSocketApp(...)``
+# directly and tests can patch ``btc_stochastic_monitor.WebSocketApp`` with a
+# fake for the reconnect / integration suites (REQ-3.1, REQ-8).
+from websocket import WebSocketApp
 
 # =============================================================================
 # Module-Level Constants
@@ -1198,3 +1205,150 @@ def on_close(
         reason,
         extra={"category": "WS"},
     )
+
+
+# =============================================================================
+# Buffer Freshness / Gap Detection and the Resilient Reconnection Loop
+# =============================================================================
+
+
+def check_buffer_freshness(state: MonitorState, now_ms: int) -> bool:
+    """Decide whether the candle buffer is fresh enough to keep across a reconnect.
+
+    Purpose:
+        Implement the gap-detection check from the design's Reconnection Flow
+        (REQ-8.5). After a WebSocket disconnect the candle buffer may be stale --
+        e.g. the process slept or lost connectivity for longer than one full
+        interval -- in which case the indicator output would be computed over old
+        data. This function tells :func:`run_forever` whether the buffer can be
+        preserved (fresh) or must be discarded and re-bootstrapped (stale).
+
+    Inputs:
+        state: The shared :class:`MonitorState`; only ``state.buffer`` is read.
+        now_ms: The current wall-clock time in Unix epoch milliseconds (the
+            caller supplies ``int(time.time() * 1000)``).
+
+    Returns / side effects:
+        Returns ``True`` (fresh) iff ``state.buffer`` is non-empty AND the age of
+        the most recent candle -- ``now_ms - state.buffer[-1].open_time_ms`` -- is
+        at most :data:`STALE_BUFFER_THRESHOLD_MS` (1 day). Returns ``False``
+        (stale, re-bootstrap required) when the buffer is empty or the latest
+        candle is older than that threshold. No side effects.
+    """
+    # An empty buffer has no most-recent candle to age-check; treat it as stale
+    # so the caller re-bootstraps before opening a session (REQ-8.5).
+    if not state.buffer:
+        return False
+
+    # Fresh iff the newest candle's age is within the stale-buffer threshold.
+    # ``buffer[-1]`` is the latest candle because the buffer is kept sorted
+    # strictly ascending by open_time_ms (REQ-4.3).
+    age_ms = now_ms - state.buffer[-1].open_time_ms
+    return age_ms <= STALE_BUFFER_THRESHOLD_MS
+
+
+def run_forever(state: MonitorState) -> None:
+    """Run the persistent WebSocket reconnection loop for the lifetime of the Monitor.
+
+    Purpose:
+        Drive the runtime half of the design's Reconnection Flow: keep a live
+        Binance kline WebSocket session open inside a ``while True`` loop, recover
+        transparently from any disconnect or exception after a fixed delay, and
+        re-bootstrap whenever the candle buffer has gone stale across a gap
+        (REQ-8.1..REQ-8.7, REQ-10.4). The candle buffer and the ``is_oversold``
+        Cool_Down_Lock live on the long-lived ``state`` outside the session
+        lifecycle, so a normal reconnect preserves them automatically (REQ-8.4).
+
+    Inputs:
+        state: The shared :class:`MonitorState`. ``state.buffer`` and
+            ``state.is_oversold`` are read for freshness and may be reset/repopulated
+            on a stale-buffer recovery; ``state`` is bound to the WebSocket
+            callbacks so they can mutate the buffer and lock across sessions.
+
+    Returns / side effects:
+        Never returns under normal operation -- the loop is infinite by design
+        (REQ-8.1); the process ends only via a fatal signal (see design
+        "Termination Conditions"). Each iteration:
+
+        1. Computes ``now_ms = int(time.time() * 1000)`` and calls
+           :func:`check_buffer_freshness`. When the buffer is stale (REQ-8.5),
+           discards ``state.buffer`` (set to ``[]``), resets
+           ``state.is_oversold = False``, logs a RECONNECT-category WARNING, and
+           re-runs :func:`bootstrap_history` to repopulate the buffer before a
+           new session opens.
+        2. Constructs a :data:`WebSocketApp` for :data:`BINANCE_WS_URL` with the
+           ``on_open`` / ``on_message`` / ``on_close`` callbacks bound to ``state``
+           via :func:`functools.partial` (so the app sees the ``(ws)``,
+           ``(ws, raw)``, and ``(ws, code, reason)`` callables it expects, REQ-3.2),
+           and calls ``ws.run_forever()`` inside a ``try``/``except Exception`` so
+           any connection or runtime error is caught rather than crashing the
+           Monitor (REQ-8.2).
+        3. On any exception OR a normal session close, increments the
+           reconnect-attempt counter, logs a RECONNECT-category INFO record
+           carrying that counter (REQ-10.4), and sleeps
+           :data:`RECONNECT_DELAY_S` seconds before the next iteration (REQ-8.3).
+    """
+    logger = logging.getLogger(LOGGER_NAME)
+
+    # Reconnect-attempt counter included in every RECONNECT INFO record so an
+    # operator can audit how many sessions have been opened (REQ-10.4). Starts at
+    # 0 and is incremented once per loop iteration before logging.
+    reconnect_attempts = 0
+
+    # Persistent reconnection loop (REQ-8.1). Infinite by design -- no break.
+    while True:
+        # --- Step 1: gap detection / stale-buffer recovery (REQ-8.5) ---------
+        # Use the current wall-clock time in ms to age the newest candle.
+        now_ms = int(time.time() * 1000)
+        if not check_buffer_freshness(state, now_ms):
+            # The buffer is empty or too old to trust: discard it, release the
+            # cool-down lock, and re-bootstrap so the new session starts from a
+            # fresh, chronologically-seeded buffer (REQ-8.5).
+            state.buffer = []
+            state.is_oversold = False
+            logger.warning(
+                "Candle buffer is stale or empty; discarding buffer, resetting "
+                "is_oversold, and re-bootstrapping before reconnecting.",
+                extra={"category": "RECONNECT"},
+            )
+            bootstrap_history(state)
+
+        # --- Step 2: open a WebSocket session (REQ-3.1, REQ-3.2, REQ-8.2) ----
+        # Bind the shared state as the first positional argument of each callback
+        # so the WebSocketApp receives exactly the (ws), (ws, raw), and
+        # (ws, code, reason) callables it invokes, while the buffer/lock survive
+        # across sessions on ``state`` (REQ-8.4). ``WebSocketApp`` is referenced
+        # as a module-level name so tests can patch it (see import note above).
+        try:
+            ws = WebSocketApp(
+                BINANCE_WS_URL,
+                on_open=functools.partial(on_open, state),
+                on_message=functools.partial(on_message, state),
+                on_close=functools.partial(on_close, state),
+            )
+            # Blocks for the lifetime of the session; returns on a normal close.
+            ws.run_forever()
+        except Exception as exc:
+            # Any connection/protocol/runtime error is caught so a single failure
+            # never crashes the Monitor; it simply triggers a reconnect (REQ-8.2).
+            logger.warning(
+                "WebSocket session raised an exception (%s: %s); will reconnect.",
+                type(exc).__name__,
+                exc,
+                extra={"category": "RECONNECT"},
+            )
+
+        # --- Step 3: reconnect bookkeeping + delay (REQ-8.3, REQ-10.4) -------
+        # Reached on BOTH a normal close and a caught exception. Count the
+        # attempt, log a RECONNECT record carrying the counter (REQ-10.4), then
+        # wait the fixed Reconnect_Delay before opening the next session
+        # (REQ-8.3, REQ-8.7).
+        reconnect_attempts += 1
+        logger.info(
+            "WebSocket session ended; reconnecting in %s s "
+            "(reconnect attempt #%s).",
+            RECONNECT_DELAY_S,
+            reconnect_attempts,
+            extra={"category": "RECONNECT"},
+        )
+        time.sleep(RECONNECT_DELAY_S)
