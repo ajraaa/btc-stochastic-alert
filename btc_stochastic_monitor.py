@@ -254,3 +254,82 @@ def validate_config() -> None:
             extra={"category": "CONFIG"},
         )
         sys.exit(1)
+
+
+# =============================================================================
+# Data Models
+# -----------------------------------------------------------------------------
+# Small, explicit value/state containers shared across components. ``Candle``
+# and ``StochasticReading`` are immutable (frozen) value objects; ``MonitorState``
+# is the single mutable container that survives WebSocket session restarts
+# (REQ-8.4). ``TriggerDecision`` enumerates the cool-down state-machine outcomes
+# and doubles as the trigger-decision field in indicator-evaluation log records
+# (REQ-10.5).
+# =============================================================================
+
+
+@dataclasses.dataclass(frozen=True)
+class Candle:
+    """An immutable OHLCV record for one 1-day kline.
+
+    Open time is stored as Unix epoch milliseconds (Binance's native unit) so
+    candles compare and sort unambiguously and so buffer operations can key on
+    ``open_time_ms`` for append/replace/discard decisions (REQ-2.3, REQ-4.1,
+    REQ-4.3, REQ-4.4, REQ-4.5). Constructed from either a REST bootstrap row
+    ``[openTime, open, high, low, close, volume, ...]`` (REQ-2.3) or a WebSocket
+    kline object ``{"t", "o", "h", "l", "c", "v", "x"}`` (REQ-3.3).
+    """
+
+    open_time_ms: int  # epoch ms; equality and ordering key (REQ-4.1, REQ-4.4, REQ-4.5)
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+
+
+@dataclasses.dataclass(frozen=True)
+class StochasticReading:
+    """An immutable snapshot of the latest Stochastic Oscillator output.
+
+    Produced by ``compute_stochastic`` from the last row of the pandas-ta
+    result and forwarded to the Trigger_Evaluator (REQ-5.6). ``k`` and ``d`` are
+    the finite (non-NaN) latest ``STOCHk_5_3_3`` / ``STOCHd_5_3_3`` values;
+    ``close`` is the closing price of the Closed_Candle; ``close_time_ms`` is the
+    candle close time used in indicator-evaluation log records (REQ-10.5).
+    """
+
+    k: float  # latest STOCHk_5_3_3, finite (not NaN)
+    d: float  # latest STOCHd_5_3_3, finite (not NaN)
+    close: float  # close price of the Closed_Candle (REQ-5.6)
+    close_time_ms: int  # candle close time, for log records (REQ-10.5)
+
+
+class TriggerDecision(enum.Enum):
+    """Outcomes of the cool-down trigger state machine.
+
+    Each member's string value is the exact human-readable decision recorded in
+    indicator-evaluation log records, so the enum value can be logged directly
+    (REQ-10.5).
+    """
+
+    FIRE = "alert dispatched"  # k < threshold and not previously oversold (REQ-6.2)
+    SUPPRESS = "suppressed by cool-down"  # oversold and k <= threshold (REQ-6.3)
+    RESET = "cool-down released"  # oversold and k > threshold (REQ-6.4)
+    QUIET = "no oversold condition"  # k >= threshold and not oversold
+
+
+@dataclasses.dataclass
+class MonitorState:
+    """The single mutable container shared across components.
+
+    Lives in module scope so its contents survive WebSocket session restarts:
+    on reconnect the candle buffer and ``is_oversold`` cool-down lock are
+    preserved rather than reset (REQ-8.4). ``is_oversold`` is the boolean
+    Cool_Down_Lock, initialized to ``False`` at startup (REQ-6.1). ``logger`` is
+    the shared Logger, assigned during ``main`` after ``init_logger`` runs.
+    """
+
+    buffer: list[Candle]  # bounded, chronological candle buffer (REQ-2.2, REQ-4)
+    is_oversold: bool = False  # Cool_Down_Lock, starts False (REQ-6.1)
+    logger: logging.Logger | None = None  # shared Logger, set in main()
