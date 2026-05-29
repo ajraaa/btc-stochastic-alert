@@ -28,6 +28,7 @@ import typing
 
 # --- Third-party imports -----------------------------------------------------
 import pandas as pd
+import requests  # Telegram Bot HTTP API client for the Notifier (REQ-7.4)
 
 # =============================================================================
 # Module-Level Constants
@@ -589,3 +590,129 @@ def evaluate_trigger(state: MonitorState, reading: StochasticReading) -> Trigger
     # condition and no state change.
     # Resulting state: is_oversold unchanged (remains False).
     return TriggerDecision.QUIET
+
+
+# =============================================================================
+# Notifier (Telegram delivery)
+# =============================================================================
+
+
+def format_alert(symbol: str, interval: str, reading: StochasticReading) -> str:
+    """Build the human-readable Telegram alert text for an oversold signal.
+
+    Purpose:
+        Render the message body the Notifier delivers when the Trigger_Evaluator
+        fires an oversold alert, surfacing every field a trader needs to act:
+        the asset, the timeframe, the latest %K and %D (each to two decimals),
+        and the closing price (REQ-7.2).
+
+    Inputs:
+        symbol: The trading symbol (e.g. :data:`SYMBOL`, ``"btcusdt"``).
+        interval: The kline interval (e.g. :data:`INTERVAL`, ``"1d"``).
+        reading: The :class:`StochasticReading` whose ``k``, ``d``, and ``close``
+            are embedded in the message. ``k`` and ``d`` are formatted with the
+            ``"{:.2f}"`` two-decimal pattern; ``close`` is rendered as a numeric
+            value.
+
+    Returns / side effects:
+        Returns the formatted message string. No side effects.
+    """
+    # Two-decimal formatting for %K and %D per REQ-7.2; ``close`` is rendered as
+    # a plain numeric value so the price is unambiguous.
+    return (
+        f"BTC Stochastic DCA alert: {symbol} @ {interval} is oversold. "
+        f"%K={reading.k:.2f} %D={reading.d:.2f} close={reading.close}"
+    )
+
+
+def send_telegram_notification(message: str) -> bool:
+    """Deliver a message to the configured Telegram chat via the Bot HTTP API.
+
+    Purpose:
+        Invoke the Notifier to POST ``message`` to the Telegram ``sendMessage``
+        endpoint using the operator-supplied bot token and chat ID. The function
+        follows the Monitor's "log and continue" philosophy: it never raises, so
+        a delivery failure can never crash the Monitor (REQ-7.1, REQ-7.3..7.6).
+
+    Inputs:
+        message: The alert text to deliver (typically produced by
+            :func:`format_alert`).
+
+    Returns / side effects:
+        Returns ``True`` when Telegram responds with a 2xx status, ``False``
+        otherwise (missing config, non-2xx response, or a transport exception).
+        Emits exactly one log record through the shared Logger describing the
+        outcome:
+
+        * Missing/empty token or chat ID at send time -> CONFIG-category ERROR,
+          POST skipped, returns ``False`` (REQ-7.6).
+        * Non-2xx HTTP response -> NOTIFY-category ERROR including the status
+          code, returns ``False`` (REQ-7.3).
+        * ``requests.RequestException`` (connection/timeout) -> NOTIFY-category
+          ERROR including the exception type and message, returns ``False``
+          (REQ-7.5).
+        * Success -> NOTIFY-category INFO recording dispatch success, returns
+          ``True`` (REQ-10.6).
+    """
+    logger = logging.getLogger(LOGGER_NAME)
+
+    # Re-validate credentials at send time so a token/chat ID cleared after
+    # startup (or a test monkeypatching the module globals) is caught here
+    # rather than producing a malformed request. On missing config, log a
+    # CONFIG error, skip the POST, and return False (REQ-7.6).
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_BOT_TOKEN.strip():
+        logger.error(
+            "Cannot dispatch Telegram notification: TELEGRAM_BOT_TOKEN is "
+            "missing or empty. Skipping send.",
+            extra={"category": "CONFIG"},
+        )
+        return False
+
+    if not TELEGRAM_CHAT_ID or not TELEGRAM_CHAT_ID.strip():
+        logger.error(
+            "Cannot dispatch Telegram notification: TELEGRAM_CHAT_ID is "
+            "missing or empty. Skipping send.",
+            extra={"category": "CONFIG"},
+        )
+        return False
+
+    # Build the endpoint URL from the current token value so monkeypatched
+    # credentials take effect (do NOT capture the token at import time).
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+
+    try:
+        response = requests.post(
+            url,
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": message},
+            timeout=TELEGRAM_TIMEOUT_S,
+        )
+    except requests.RequestException as exc:
+        # Connection/timeout/transport failure: log type + message and continue
+        # without crashing the Monitor (REQ-7.5).
+        logger.error(
+            "Telegram notification dispatch failed (%s: %s); continuing.",
+            type(exc).__name__,
+            exc,
+            extra={"category": "NOTIFY"},
+        )
+        return False
+
+    # Treat any 2xx as success; otherwise log the HTTP status code and continue
+    # without crashing (REQ-7.3).
+    status_code = response.status_code
+    if not 200 <= status_code < 300:
+        logger.error(
+            "Telegram notification dispatch returned non-success HTTP status "
+            "%s; continuing.",
+            status_code,
+            extra={"category": "NOTIFY"},
+        )
+        return False
+
+    # Success: record dispatch completion (REQ-10.6).
+    logger.info(
+        "Telegram notification dispatched successfully (HTTP %s).",
+        status_code,
+        extra={"category": "NOTIFY"},
+    )
+    return True
