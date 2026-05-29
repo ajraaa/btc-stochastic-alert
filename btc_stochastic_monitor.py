@@ -187,3 +187,70 @@ def init_logger(log_path: str) -> logging.Logger:
         )
 
     return logger
+
+
+# =============================================================================
+# Configuration Validation & Startup Guard
+# =============================================================================
+
+
+def validate_config() -> None:
+    """Validate the runtime environment and required credentials before startup.
+
+    Purpose:
+        Enforce the only two fail-fast termination conditions in the Monitor
+        (see design "Termination Conditions"): an unsupported Python version
+        and missing/empty Telegram credentials. Both checks run *before any
+        network connection is opened* (REQ-1.9, REQ-10.2). This function is
+        invoked from ``main`` (wired in task 12.2) ahead of ``bootstrap_history``.
+
+    Inputs:
+        None. Reads the module-level interpreter version (``sys.version_info``)
+        and the :data:`TELEGRAM_BOT_TOKEN` / :data:`TELEGRAM_CHAT_ID` constants.
+
+    Returns / side effects:
+        Returns ``None`` when the environment is valid. Otherwise emits a
+        ``CONFIG``-category ERROR log record through the shared Logger and
+        terminates the process via ``sys.exit(1)``. The Logger may not yet have
+        handlers attached when this runs (``main`` calls ``validate_config``
+        before ``init_logger``); in that case Python's logging "last resort"
+        handler still surfaces the ERROR to stderr, so the operator always sees
+        the reason for termination without resorting to ``print`` (REQ-11.6).
+    """
+    # All components resolve the same named Logger; obtain it here even though
+    # handlers may not be configured yet (REQ-11.6).
+    logger = logging.getLogger(LOGGER_NAME)
+
+    # --- Python version guard (REQ-10.1, REQ-10.2) ---------------------------
+    # Check the interpreter version first so an unsupported runtime is reported
+    # before we even look at credentials, and always before any network call.
+    if sys.version_info < (3, 10):
+        detected = ".".join(str(part) for part in sys.version_info[:3])
+        logger.error(
+            "Unsupported Python version %s detected; the Monitor requires "
+            "Python 3.10 or later. Terminating before opening any network "
+            "connection.",
+            detected,
+            extra={"category": "CONFIG"},
+        )
+        sys.exit(1)
+
+    # --- Telegram credential guard (REQ-1.9) ---------------------------------
+    # A missing or empty (after stripping whitespace) token or chat ID makes
+    # notification delivery impossible, so terminate before any network call and
+    # name the offending constant so the operator knows exactly what to fix.
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_BOT_TOKEN.strip():
+        logger.error(
+            "Required configuration constant TELEGRAM_BOT_TOKEN is missing or "
+            "empty. Terminating before opening any network connection.",
+            extra={"category": "CONFIG"},
+        )
+        sys.exit(1)
+
+    if not TELEGRAM_CHAT_ID or not TELEGRAM_CHAT_ID.strip():
+        logger.error(
+            "Required configuration constant TELEGRAM_CHAT_ID is missing or "
+            "empty. Terminating before opening any network connection.",
+            extra={"category": "CONFIG"},
+        )
+        sys.exit(1)
