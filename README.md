@@ -114,7 +114,7 @@ The Monitor is intentionally minimalist: **one source file**, one in-memory cand
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/your-username/btc-stochastic-alert.git
+git clone https://github.com/ajraaa/btc-stochastic-alert.git
 cd btc-stochastic-alert
 
 # 2. (Recommended) Create and activate a virtual environment
